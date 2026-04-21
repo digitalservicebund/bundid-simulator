@@ -20,6 +20,11 @@
 		<java.version>25</java.version>
 		<maven.compiler.release>25</maven.compiler.release>
 		<maven.compiler.proc>full</maven.compiler.proc>
+
+		<!-- Updating these versions because of vulnerabilities in Spring Boot 4.0.5 -->
+		<tomcat.version>11.0.21</tomcat.version>
+		<thymeleaf.version>3.1.4.RELEASE</thymeleaf.version>
+		<jackson-bom.version>3.1.1</jackson-bom.version>
 	</properties>
 
 	<dependencies>
