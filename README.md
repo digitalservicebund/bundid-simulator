@@ -1,14 +1,6 @@
 # BundID-Simulator
 
-## Note: This repo was moved
-
-We have transfered this repo to our new organisation `ba-itsys`.
-The location of the BundID-Simulator Docker image has been moved to `ghcr.io/ba-itsys/bundid-simulator`.
-
-```diff
-- ghcr.io/opdt/bundid-simulator:<tag>
-+ ghcr.io/ba-itsys/bundid-simulator:<tag>
-```
+This is DigitalService's fork of the BundID Simulator from IT-Systemhaus der Bundesagentur für Arbeit.
 
 ## Übersicht
 

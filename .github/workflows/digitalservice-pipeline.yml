@@ -1,0 +1,159 @@
+name: Pipeline
+
+# Skip pipeline if only Markdown, png or svg files in root or in `docs/` changed.
+on:
+  push:
+
+env:
+  PROJECT_NAME: gruenden-bundid-simulator
+  CONTAINER_REGISTRY: ghcr.io
+  CONTAINER_IMAGE_NAME: ${{ github.repository }}
+  CONTAINER_IMAGE_VERSION: ${{ github.sha }}
+  INFRA_REPO: gruenden-infra
+  SLACK_ALERTS_CHANNEL_ID: C0AM77YMR6G
+
+jobs:
+  build-push-image:
+    name: Build, push and scan Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: write # Required for identity challenge with sigstore/fulcio
+      packages: write
+      security-events: write # Required for uploading SARIF results to GitHub Security tab
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ${{ env.CONTAINER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Build and push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          push: true
+          tags: ${{ env.CONTAINER_REGISTRY }}/${{ env.CONTAINER_IMAGE_NAME }}:${{ env.CONTAINER_IMAGE_VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          sbom: true
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        env:
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db,public.ecr.aws/aquasecurity/trivy-db
+        with:
+          image-ref: ${{ env.CONTAINER_REGISTRY }}/${{ env.CONTAINER_IMAGE_NAME }}:${{ env.CONTAINER_IMAGE_VERSION }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+
+      - name: Upload Trivy scan results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: "trivy-results.sarif"
+          path: "trivy-results.sarif"
+          if-no-files-found: error
+
+      - name: Upload Trivy scan results to GitHub Security tab # TODO: Re-enable once the repository is public again or Code Security is enabled
+        uses: github/codeql-action/upload-sarif@c10b8064de6f491fea524254123dbe5e09572f13 # v4.35.1
+        if: ${{ false }}
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      - name: Fail pipeline if HIGH or CRITICAL vulnerabilities found in sarif report # level == "error" from the SARIF, which is the reliable way to detect HIGH/CRITICAL findings, MEDIUM has level "warning" and LOW has level "note"
+        run: |
+          COUNT=$(jq '[.runs[].results[] | select(.level == "error")] | length' trivy-results.sarif) 
+          if [ "$COUNT" -gt 0 ]; then
+            echo "### :x: Found $COUNT HIGH/CRITICAL vulnerabilities" >> $GITHUB_STEP_SUMMARY
+            jq -r '.runs[].results[] | select(.level == "error") | .message.text' trivy-results.sarif >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Generate cosign vulnerability scan record
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        env:
+          TRIVY_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-db,public.ecr.aws/aquasecurity/trivy-db
+        with:
+          image-ref: ${{ env.CONTAINER_REGISTRY }}/${{ env.CONTAINER_IMAGE_NAME }}:${{ env.CONTAINER_IMAGE_VERSION }}
+          format: "cosign-vuln"
+          output: "${{ env.PROJECT_NAME }}-vulnerabilities.json"
+
+      - name: Upload cosign vulnerability scan record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: "${{ env.PROJECT_NAME }}-vulnerabilities.json"
+          path: "${{ env.PROJECT_NAME }}-vulnerabilities.json"
+          if-no-files-found: error
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad
+        with:
+          cosign-release: "v2.6.0" # We need this, because the kyverno policy that is validating the signature is not yet compatible with the newer version of cosign. Cosign switch the bundle format in version 3.
+
+      - name: Sign the published Docker image
+        run: cosign sign --yes ${{ env.CONTAINER_REGISTRY }}/${{ env.CONTAINER_IMAGE_NAME }}:${{ env.CONTAINER_IMAGE_VERSION }}
+
+      - name: Attest the vulnerability scan
+        run: cosign attest --yes --replace --predicate ${{ env.PROJECT_NAME }}-vulnerabilities.json --type vuln ${{ env.CONTAINER_REGISTRY }}/${{ env.CONTAINER_IMAGE_NAME }}:${{ env.CONTAINER_IMAGE_VERSION }}
+
+  deploy-development:
+    name: Deploy to development environment
+    runs-on: ubuntu-latest
+    needs:
+      [
+        build-push-image,
+      ]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Deploy to development
+        uses: digitalservicebund/argocd-deploy@6033da861398e0d7fcffe1b195f8d58f10b62c4e # auth-token branch
+        with:
+          environment: development/gruenden-bundid-simulator
+          version: ${{ github.sha }}
+          deploying_repo: ${{ github.event.repository.name }}
+          infra_repo: ${{ env.INFRA_REPO }}
+          github_app_id: ${{ secrets.GITOPS_GRUENDEN_APP_ID }}
+          github_app_private_key: ${{ secrets.GITOPS_GRUENDEN_APP_PRIVATE_KEY }}
+          app: ${{ env.PROJECT_NAME }}-development
+          argocd_auth_token: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          argocd_server: ${{ secrets.ARGOCD_SERVER_STACKIT }}
+
+  alert-pipeline-failure: # central job for all failure alerts related to this pipeline.
+    name: Send failure message to Slack
+    needs:
+      [
+        build-push-image,
+        deploy-development,
+      ]
+    if: always() && failure() && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/user-testing')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find failed jobs # Needed to get the job name of the job that failed. If parallel jobs are running, there could be multiple failed jobs, so we join them with a comma.
+        id: find-failed-job
+        run: |
+          FAILED_JOBS=$(echo '${{ toJSON(needs) }}' | \
+            jq -r '
+              to_entries
+              | map(select(.value.result == "failure"))
+              | map(.key)
+              | join(", ")
+            ')
+
+          if [ -z "$FAILED_JOBS" ]; then
+            FAILED_JOBS="unknown"
+          fi
+
+          echo "job_names=$FAILED_JOBS" >> $GITHUB_OUTPUT
+      - uses: digitalservicebund/notify-on-failure-gha@671832f192aee0a068fd92b2f6deb975df794a84
+        with:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ env.SLACK_ALERTS_CHANNEL_ID }}
+          GITHUB_JOB_NAME: ${{ steps.find-failed-job.outputs.job_names }}
