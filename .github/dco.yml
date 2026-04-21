@@ -1,3 +1,0 @@
-# https://github.com/dcoapp/app?tab=readme-ov-file#skipping-sign-off-for-organization-members
-require:
-  members: false
